@@ -34,14 +34,15 @@ except Exception as e:
         log.warning("sageattention DLL loading error, sageattention will not be available")
     sageattn_func = None
 
+# Try to import SageAttention3 Blackwell FP4
 try:
-    from sageattention import sageattn_blackwell
+    from sageattention import sageattn_blackwell, sage4_attn, sage4_quant
     SAGE3_AVAILABLE = True
-    log.info("SageAttention3 (Blackwell FP4) is available")
+    log.info("SageAttention3 Blackwell (sage4) loaded successfully")
 except Exception as e:
-    log.warning(f"SageAttention3 (Blackwell FP4) not available: {e}")
-    sageattn_blackwell = None
+    log.warning(f"SageAttention3 Blackwell not available: {str(e)}")
     SAGE3_AVAILABLE = False
+    sageattn_blackwell = None
 
 
 __all__ = [
@@ -205,17 +206,19 @@ def attention(
                 log.warning("SageAttention not available, falling back to SDPA")
                 return torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2).contiguous()
 
-        # SageAttention3 with INT8/FP16 for Blackwell (RTX 5090)
-        # Balanced mode: INT8 for QK, FP16 for PV
-        return sageattn_blackwell(
-            q.transpose(1,2),
-            k.transpose(1,2),
-            v.transpose(1,2),
-            pv_dtype=torch.float16,      # PV operations in FP16
-            qk_dtype="int8",              # QK operations in INT8
-            smooth_k=True,                # Enable K matrix smoothing for better accuracy
-            per_block_mean=False          # Disable per-block mean for lower VRAM usage
-        ).transpose(1,2).contiguous()
+        try:
+            return sageattn_blackwell(
+                q.transpose(1,2),
+                k.transpose(1,2),
+                v.transpose(1,2),
+                per_block_mean=True
+            ).transpose(1,2).contiguous()
+        except Exception as e:
+            log.warning(f"SageAttention3 failed: {e}, falling back to regular SageAttention")
+            if sageattn_func is not None:
+                return sageattn_func(q, k, v, tensor_layout="NHD").contiguous()
+            else:
+                return torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2).contiguous()
     elif attention_mode == 'sageattn_3_fp4':
         if not SAGE3_AVAILABLE or sageattn_blackwell is None:
             log.warning("SageAttention3 FP4 not available, falling back to sageattn_3 mode")
@@ -224,17 +227,19 @@ def attention(
             else:
                 return torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2).contiguous()
 
-        # SageAttention3 with FP4 microscaling for maximum performance on Blackwell
-        # This is the breakthrough 1038 TOPS mode for RTX 5090
-        return sageattn_blackwell(
-            q.transpose(1,2),
-            k.transpose(1,2),
-            v.transpose(1,2),
-            pv_dtype=torch.float16,      # PV operations in FP16 (best accuracy/speed balance)
-            qk_dtype="fp4",               # QK operations in FP4 microscaling (maximum speed)
-            smooth_k=True,                # Enable K matrix smoothing
-            per_block_mean=True           # Enable per-block mean for FP4 (better accuracy)
-        ).transpose(1,2).contiguous()
+        try:
+            return sageattn_blackwell(
+                q.transpose(1,2),
+                k.transpose(1,2),
+                v.transpose(1,2),
+                per_block_mean=True
+            ).transpose(1,2).contiguous()
+        except Exception as e:
+            log.warning(f"SageAttention3 FP4 failed: {e}, falling back to regular SageAttention")
+            if sageattn_func is not None:
+                return sageattn_func(q, k, v, tensor_layout="NHD").contiguous()
+            else:
+                return torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2).contiguous()
     elif attention_mode == 'sageattn_3_fp8':
         if not SAGE3_AVAILABLE or sageattn_blackwell is None:
             log.warning("SageAttention3 FP8 not available, falling back to regular SageAttention")
@@ -243,15 +248,18 @@ def attention(
             else:
                 return torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2).contiguous()
 
-        # SageAttention3 with FP8 for both QK and PV (ultra-fast mode)
-        return sageattn_blackwell(
-            q.transpose(1,2),
-            k.transpose(1,2),
-            v.transpose(1,2),
-            pv_dtype=torch.float8_e4m3fn, # PV operations in FP8 (maximum speed)
-            qk_dtype="int8",               # QK operations in INT8
-            smooth_k=True,
-            per_block_mean=False
-        ).transpose(1,2).contiguous()
+        try:
+            return sageattn_blackwell(
+                q.transpose(1,2),
+                k.transpose(1,2),
+                v.transpose(1,2),
+                per_block_mean=True
+            ).transpose(1,2).contiguous()
+        except Exception as e:
+            log.warning(f"SageAttention3 FP8 failed: {e}, falling back to regular SageAttention")
+            if sageattn_func is not None:
+                return sageattn_func(q, k, v, tensor_layout="NHD").contiguous()
+            else:
+                return torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2).contiguous()
     else:
         return sageattn_func(q, k, v, tensor_layout="NHD").contiguous()
