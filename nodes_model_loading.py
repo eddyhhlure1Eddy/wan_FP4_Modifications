@@ -25,6 +25,8 @@ try:
 except:
     pass
 
+from .svd_model_loader import SVDModelLoader
+
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
 device = mm.get_torch_device()
@@ -973,7 +975,7 @@ class WanVideoModelLoader:
             "required": {
                 "model": (folder_paths.get_filename_list("unet_gguf") + folder_paths.get_filename_list("diffusion_models"), {"tooltip": "These models are loaded from the 'ComfyUI/models/diffusion_models' -folder",}),
 
-            "base_precision": (["fp32", "bf16", "fp16", "fp16_fast"], {"default": "bf16"}),
+            "base_precision": (["disabled", "fp32", "bf16", "fp16", "fp16_fast", "fp8_e4m3fn", "fp8_e4m3fn_fast"], {"default": "bf16", "tooltip": "'disabled' auto-detects precision from weights. fp8_e4m3fn/fp8_e4m3fn_fast auto-enable FP8 quantization (base layers use BF16, linear layers use FP8). fp8_e4m3fn_fast requires CUDA compute capability >= 8.9"}),
             "quantization": (["disabled", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e4m3fn_scaled", "fp8_e4m3fn_scaled_fast", "fp8_e5m2", "fp8_e5m2_fast", "fp8_e5m2_scaled", "fp8_e5m2_scaled_fast", "fp4_experimental", "fp4_scaled", "fp4_scaled_fast"], {"default": "disabled",
                             "tooltip": "Optional quantization method, 'disabled' acts as autoselect based by weights. Scaled modes only work with matching weights, _fast modes (fp8 matmul) require CUDA compute capability >= 8.9 (NVIDIA 4000 series and up), e4m3fn generally can not be torch.compiled on compute capability < 8.9 (3000 series and under). fp4_experimental uses FP8 weights + FP4 attention (requires sageattn_3_fp4 mode). fp4_scaled/fp4_scaled_fast for scaled FP8 models with FP4 attention"}),
             "load_device": (["main_device", "offload_device"], {"default": "offload_device", "tooltip": "Initial device to load the model to, NOT recommended with the larger models unless you have 48GB+ VRAM"}),
@@ -1041,31 +1043,77 @@ class WanVideoModelLoader:
         if lora is not None and not merge_loras:
             transformer_load_device = offload_device
 
-        base_dtype = {"fp8_e4m3fn": torch.float8_e4m3fn, "fp8_e4m3fn_fast": torch.float8_e4m3fn, "bf16": torch.bfloat16, "fp16": torch.float16, "fp16_fast": torch.float16, "fp32": torch.float32}[base_precision]
-        
-        if base_precision == "fp16_fast":
+        model_path = folder_paths.get_full_path_or_raise("diffusion_models", model)
+
+        gguf_reader = None
+        if not gguf:
+            if SVDModelLoader.is_svd_compressed(model_path):
+                log.info("Detected SVD compressed model, loading with reconstruction...")
+                sd = SVDModelLoader.load_svd_compressed_model(model_path, device='cuda' if torch.cuda.is_available() else 'cpu')
+            else:
+                sd = load_torch_file(model_path, device=transformer_load_device, safe_load=True)
+        else:
+            gguf_reader=[]
+            from .gguf.gguf import load_gguf
+            sd, reader = load_gguf(model_path)
+            gguf_reader.append(reader)
+
+        if base_precision == "disabled":
+            detected_dtype = None
+            for k, v in sd.items():
+                if isinstance(v, torch.Tensor) and not k.endswith(".scale_weight"):
+                    if v.dtype in [torch.float32, torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]:
+                        detected_dtype = v.dtype
+                        break
+            if detected_dtype is None:
+                detected_dtype = torch.bfloat16
+                log.warning("Could not detect base precision from weights, defaulting to bfloat16")
+            else:
+                log.info(f"Auto-detected base_precision from weights: {detected_dtype}")
+
+            if detected_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                if quantization == "disabled":
+                    quantization = "fp8_e4m3fn" if detected_dtype == torch.float8_e4m3fn else "fp8_e5m2"
+                    log.info(f"Auto-enabled quantization={quantization} for FP8 weights")
+                base_dtype = torch.bfloat16
+                log.info(f"Using bfloat16 for base layers (norm, bias, etc.) with FP8 quantization")
+            else:
+                base_dtype = detected_dtype
+
+            base_precision_name = {torch.float32: "fp32", torch.bfloat16: "bf16", torch.float16: "fp16",
+                                  torch.float8_e4m3fn: "fp8_e4m3fn", torch.float8_e5m2: "fp8_e5m2"}[detected_dtype]
+        else:
+            if base_precision in ["fp8_e4m3fn", "fp8_e4m3fn_fast"]:
+                if quantization == "disabled":
+                    quantization = base_precision
+                    log.info(f"Auto-enabled quantization={quantization} based on base_precision")
+                base_dtype = torch.bfloat16
+                log.info(f"Using bfloat16 for base layers (norm, bias, etc.) with {base_precision} quantization")
+            else:
+                base_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp16_fast": torch.float16, "fp32": torch.float32}[base_precision]
+            base_precision_name = base_precision
+
+        if base_precision == "fp8_e4m3fn_fast":
+            if torch.cuda.is_available():
+                major, minor = torch.cuda.get_device_capability(device)
+                if (major, minor) < (8, 9):
+                    raise ValueError(f"fp8_e4m3fn_fast requires CUDA compute capability >= 8.9, but got {major}.{minor}. Use fp8_e4m3fn instead.")
+                log.info(f"Using fp8_e4m3fn_fast mode with CUDA compute capability {major}.{minor}")
+
+        if base_precision == "fp16_fast" or (base_precision == "disabled" and base_dtype == torch.float16):
             if hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"):
                 torch.backends.cuda.matmul.allow_fp16_accumulation = True
+                if base_precision == "disabled":
+                    log.info("Enabled fp16_fast mode (allow_fp16_accumulation) for detected FP16 weights")
             else:
-                raise ValueError("torch.backends.cuda.matmul.allow_fp16_accumulation is not available in this version of torch, requires torch 2.7.0.dev2025 02 26 nightly minimum currently")
+                if base_precision == "fp16_fast":
+                    raise ValueError("torch.backends.cuda.matmul.allow_fp16_accumulation is not available in this version of torch, requires torch 2.7.0.dev2025 02 26 nightly minimum currently")
         else:
             try:
                 if hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"):
                     torch.backends.cuda.matmul.allow_fp16_accumulation = False
             except:
                 pass
- 
-
-        model_path = folder_paths.get_full_path_or_raise("diffusion_models", model)
-
-        gguf_reader = None
-        if not gguf:
-            sd = load_torch_file(model_path, device=transformer_load_device, safe_load=True)
-        else:
-            gguf_reader=[]
-            from .gguf.gguf import load_gguf
-            sd, reader = load_gguf(model_path)
-            gguf_reader.append(reader)
 
         is_wananimate = "pose_patch_embedding.weight" in sd
         # rename WanAnimate face fuser block keys to insert into main blocks instead
@@ -1164,18 +1212,23 @@ class WanVideoModelLoader:
         elif "control_adapter.conv.weight" in sd:
             model_type = "t2v"
 
+        num_layers = max([int(k.split('.')[1]) for k in sd.keys() if k.startswith('blocks.') and k.split('.')[1].isdigit()]) + 1
+        log.info(f"Detected num_layers from weights: {num_layers}")
+
+        if dim % 92 == 0:
+            num_heads = dim // 92
+            log.info(f"Calculated num_heads={num_heads} from dim={dim} with head_dim=92")
+        elif dim % 128 == 0:
+            num_heads = dim // 128
+            log.info(f"Calculated num_heads={num_heads} from dim={dim} with head_dim=128")
+        else:
+            num_heads = 40 if dim > 3000 else (24 if dim > 2000 else 12)
+            log.warning(f"Could not calculate num_heads from dim={dim}, using fallback num_heads={num_heads}")
+
         out_dim = 16
-        if dim == 5120: #14B
-            num_heads = 40
-            num_layers = 40
-        elif dim == 3072: #5B
-            num_heads = 24
-            num_layers = 30
+        if dim == 3072:
             out_dim = 48
-            model_type = "t2v" #5B no img crossattn
-        else: #1.3B
-            num_heads = 12
-            num_layers = 30
+            model_type = "t2v"
 
         vace_layers, vace_in_dim = None, None
         if "vace_blocks.0.after_proj.weight" in sd:
@@ -1216,21 +1269,30 @@ class WanVideoModelLoader:
             "i2v_720": np.array([1.0]*2+[0.99428, 0.99498, 0.98588, 0.98621, 0.98273, 0.98281, 0.99018, 0.99023, 0.98911, 0.98917, 0.98646, 0.98652, 0.99454, 0.99456, 0.9891, 0.98909, 0.99124, 0.99127, 0.99102, 0.99103, 0.99215, 0.99212, 0.99515, 0.99515, 0.99576, 0.99572, 0.99068, 0.99072, 0.99097, 0.99097, 0.99166, 0.99169, 0.99041, 0.99042, 0.99201, 0.99198, 0.99101, 0.99101, 0.98599, 0.98603, 0.98845, 0.98844, 0.98848, 0.98851, 0.98862, 0.98857, 0.98718, 0.98719, 0.98497, 0.98497, 0.98264, 0.98263, 0.98389, 0.98393, 0.97938, 0.9794, 0.97535, 0.97536, 0.97498, 0.97499, 0.973, 0.97301, 0.96827, 0.96828, 0.96261, 0.96263, 0.95335, 0.9534, 0.94649, 0.94655, 0.93397, 0.93414, 0.91636, 0.9165, 0.89088, 0.89109, 0.8679, 0.86768]),
         }
 
-        model_variant = "14B" #default to this
+        if dim == 1536:
+            model_variant = "1_3B"
+        elif dim == 3072:
+            model_variant = "5B"
+            log.info(f"5B model detected, no Teacache or MagCache coefficients available, consider using EasyCache for this model")
+        elif dim >= 5000:
+            model_variant = "14B"
+        else:
+            model_variant = "14B"
+            log.warning(f"Unknown dim={dim}, defaulting to 14B variant for cache coefficients")
+
         if model_type == "i2v" or model_type == "fl2v":
-            if "480" in model or "fun" in model.lower() or "a2" in model.lower() or "540" in model: #just a guess for the Fun model for now...
+            if "480" in model or "fun" in model.lower() or "a2" in model.lower() or "540" in model:
                 model_variant = "i2v_480"
             elif "720" in model:
                 model_variant = "i2v_720"
-        elif model_type == "t2v":
-            model_variant = "14B"
-            
-        if dim == 1536:
-            model_variant = "1_3B"
-        if dim == 3072:
-            log.info(f"5B model detected, no Teacache or MagCache coefficients available, consider using EasyCache for this model")
-        log.info(f"Model variant detected: {model_variant}")
-        
+
+        log.info(f"Model variant detected: {model_variant} (dim={dim}, num_heads={num_heads}, num_layers={num_layers})")
+
+        teacache_coeff = teacache_coefficients_map.get(model_variant, teacache_coefficients_map["14B"])
+        magcache_ratio = magcache_ratios_map.get(model_variant, magcache_ratios_map["14B"])
+        if model_variant not in teacache_coefficients_map:
+            log.warning(f"No cache coefficients for variant {model_variant}, using 14B defaults")
+
         TRANSFORMER_CONFIG= {
             "dim": dim,
             "in_features": in_features,
@@ -1250,8 +1312,8 @@ class WanVideoModelLoader:
             "main_device": device,
             "offload_device": offload_device,
             "dtype": base_dtype,
-            "teacache_coefficients": teacache_coefficients_map[model_variant],
-            "magcache_ratios": magcache_ratios_map[model_variant],
+            "teacache_coefficients": teacache_coeff,
+            "magcache_ratios": magcache_ratio,
             "vace_layers": vace_layers,
             "vace_in_dim": vace_in_dim,
             "inject_sample_info": True if "fps_embedding.weight" in sd else False,
@@ -1565,8 +1627,8 @@ class WanVideoVAELoader:
                 "model_name": (folder_paths.get_filename_list("vae"), {"tooltip": "These models are loaded from 'ComfyUI/models/vae'"}),
             },
             "optional": {
-                "precision": (["fp16", "fp32", "bf16"],
-                    {"default": "bf16"}
+                "precision": (["disabled", "fp16", "fp32", "bf16", "fp8_e4m3fn", "fp8_e5m2"],
+                    {"default": "bf16", "tooltip": "'disabled' auto-detects precision from weights to avoid conversion overhead"}
                 ),
                 "compile_args": ("WANCOMPILEARGS", ),
             }
@@ -1579,23 +1641,76 @@ class WanVideoVAELoader:
     DESCRIPTION = "Loads Wan VAE model from 'ComfyUI/models/vae'"
 
     def loadmodel(self, model_name, precision, compile_args=None):
-        dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
+        dtype_map = {
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+            "fp32": torch.float32,
+            "fp8_e4m3fn": torch.float8_e4m3fn,
+            "fp8_e5m2": torch.float8_e5m2
+        }
+
         model_path = folder_paths.get_full_path("vae", model_name)
         vae_sd = load_torch_file(model_path, safe_load=True)
+
+        if precision == "disabled":
+            detected_dtype = None
+            for k, v in vae_sd.items():
+                if isinstance(v, torch.Tensor) and not k.endswith(".scale_weight"):
+                    if v.dtype in [torch.float32, torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]:
+                        detected_dtype = v.dtype
+                        break
+            if detected_dtype is None:
+                detected_dtype = torch.bfloat16
+                log.warning("Could not detect VAE precision from weights, defaulting to bfloat16")
+            else:
+                log.info(f"Auto-detected VAE precision from weights: {detected_dtype}")
+            precision = {torch.float32: "fp32", torch.bfloat16: "bf16", torch.float16: "fp16",
+                        torch.float8_e4m3fn: "fp8_e4m3fn", torch.float8_e5m2: "fp8_e5m2"}[detected_dtype]
+
+        is_fp8 = precision in ["fp8_e4m3fn", "fp8_e5m2"]
+        base_dtype = torch.bfloat16 if is_fp8 else dtype_map[precision]
+        target_dtype = dtype_map[precision]
 
         has_model_prefix = any(k.startswith("model.") for k in vae_sd.keys())
         if not has_model_prefix:
             vae_sd = {f"model.{k}": v for k, v in vae_sd.items()}
 
-        if vae_sd["model.conv2.weight"].shape[0] == 16:
-            vae = WanVideoVAE(dtype=dtype)
-        elif vae_sd["model.conv2.weight"].shape[0] == 48:
-            vae = WanVideoVAE38(dtype=dtype)
+        is_int4 = any(k.endswith(".int4") for k in vae_sd.keys())
 
-        vae.load_state_dict(vae_sd)
+        if is_int4:
+            print(f"Detected INT4 quantized VAE model: {model_name}")
+            print("INT4 format is not supported by WanVideoVAELoader")
+            print("Please use BF16, FP16, FP32, FP8, or FP8_scaled format instead")
+            raise ValueError(f"INT4 quantized VAE models are not supported. Model: {model_name}")
+
+        scale_weight_keys = {}
+        if is_fp8:
+            for key in list(vae_sd.keys()):
+                if key.endswith(".scale_weight"):
+                    scale_weight_keys[key] = vae_sd[key]
+
+        if vae_sd["model.conv2.weight"].shape[0] == 16:
+            vae = WanVideoVAE(dtype=base_dtype)
+        elif vae_sd["model.conv2.weight"].shape[0] == 48:
+            vae = WanVideoVAE38(dtype=base_dtype)
+
+        if is_fp8:
+            for key in list(vae_sd.keys()):
+                if not key.endswith(".scale_weight"):
+                    if vae_sd[key].dtype in [torch.float32, torch.float16, torch.bfloat16]:
+                        vae_sd[key] = vae_sd[key].to(target_dtype)
+
+        vae.load_state_dict(vae_sd, strict=False)
+
+        if is_fp8 and len(scale_weight_keys) > 0:
+            from .fp8_optimization import convert_fp8_linear
+            convert_fp8_linear(vae.model, base_dtype, scale_weight_keys=scale_weight_keys)
+            print(f"FP8 VAE loaded with {len(scale_weight_keys)} scale weights")
+
         del vae_sd
         vae.eval()
-        vae.to(device=offload_device, dtype=dtype)
+        vae.to(device=offload_device, dtype=base_dtype)
+
         if compile_args is not None:
             vae.model.decoder = torch.compile(vae.model.decoder, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
 
@@ -1609,7 +1724,7 @@ class WanVideoTinyVAELoader:
                 "model_name": (folder_paths.get_filename_list("vae_approx"), {"tooltip": "These models are loaded from 'ComfyUI/models/vae_approx'"}),
             },
             "optional": {
-                "precision": (["fp16", "fp32", "bf16"], {"default": "fp16"}), 
+                "precision": (["disabled", "fp16", "fp32", "bf16"], {"default": "fp16", "tooltip": "'disabled' auto-detects precision from weights to avoid conversion overhead"}),
                 "parallel": ("BOOLEAN", {"default": False, "tooltip": "uses more memory but is faster"}),
             }
         }
@@ -1623,12 +1738,27 @@ class WanVideoTinyVAELoader:
     def loadmodel(self, model_name, precision, parallel=False):
         from .taehv import TAEHV
 
-        dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
         model_path = folder_paths.get_full_path("vae_approx", model_name)
         vae_sd = load_torch_file(model_path, safe_load=True)
-        
+
+        if precision == "disabled":
+            detected_dtype = None
+            for k, v in vae_sd.items():
+                if isinstance(v, torch.Tensor):
+                    if v.dtype in [torch.float32, torch.bfloat16, torch.float16]:
+                        detected_dtype = v.dtype
+                        break
+            if detected_dtype is None:
+                detected_dtype = torch.float16
+                log.warning("Could not detect TinyVAE precision from weights, defaulting to float16")
+            else:
+                log.info(f"Auto-detected TinyVAE precision from weights: {detected_dtype}")
+            dtype = detected_dtype
+        else:
+            dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
+
         vae = TAEHV(vae_sd, parallel=parallel)
-       
+
         vae.to(device = offload_device, dtype = dtype)
 
         return (vae,)
@@ -1639,8 +1769,8 @@ class LoadWanVideoT5TextEncoder:
         return {
             "required": {
                 "model_name": (folder_paths.get_filename_list("text_encoders"), {"tooltip": "These models are loaded from 'ComfyUI/models/text_encoders'"}),
-                "precision": (["fp32", "bf16"],
-                    {"default": "bf16"}
+                "precision": (["disabled", "fp32", "bf16"],
+                    {"default": "bf16", "tooltip": "'disabled' auto-detects precision from weights to avoid conversion overhead"}
                 ),
             },
             "optional": {
@@ -1660,10 +1790,24 @@ class LoadWanVideoT5TextEncoder:
 
         tokenizer_path = os.path.join(script_directory, "configs", "T5_tokenizer")
 
-        dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
-
         model_path = folder_paths.get_full_path("text_encoders", model_name)
         sd = load_torch_file(model_path, safe_load=True)
+
+        if precision == "disabled":
+            detected_dtype = None
+            for k, v in sd.items():
+                if isinstance(v, torch.Tensor):
+                    if v.dtype in [torch.float32, torch.bfloat16, torch.float16]:
+                        detected_dtype = v.dtype
+                        break
+            if detected_dtype is None:
+                detected_dtype = torch.bfloat16
+                log.warning("Could not detect T5 precision from weights, defaulting to bfloat16")
+            else:
+                log.info(f"Auto-detected T5 precision from weights: {detected_dtype}")
+            dtype = detected_dtype
+        else:
+            dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
 
         if quantization == "disabled":
             for k, v in sd.items():
