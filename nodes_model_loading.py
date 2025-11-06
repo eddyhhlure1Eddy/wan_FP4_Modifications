@@ -1332,6 +1332,46 @@ class WanVideoModelLoader:
 
         with init_empty_weights():
             transformer = WanModel(**TRANSFORMER_CONFIG)
+
+
+        # PATCH: Auto-detect multitalk_audio_proj in merged models (merged safetensors)
+        if sd is not None and any(k.startswith("multitalk_audio_proj.") for k in sd.keys()) and not hasattr(transformer, "multitalk_audio_proj"):
+            log.info("Detected multitalk_audio_proj in main model (merged model), auto-loading...")
+
+            # Create the audio projection module
+            from .multitalk.multitalk import AudioProjModel, SingleStreamMultiAttention
+            from .wanvideo.modules.model import WanLayerNorm
+
+            # Initialize AudioProjModel with InfiniteTalk defaults matching weights
+            audio_proj = AudioProjModel(
+                seq_len=5,
+                seq_len_vf=8,
+                blocks=12,
+                channels=768,
+                intermediate_dim=512,
+                output_dim=768,
+                context_tokens=32,
+                norm_output_audio=True,
+            ).to(device=device, dtype=base_dtype)
+
+            # Initialize audio_cross_attn for each block
+            for block in transformer.blocks:
+                with init_empty_weights():
+                    block.norm_x = WanLayerNorm(dim, transformer.eps, elementwise_affine=True)
+                    block.audio_cross_attn = SingleStreamMultiAttention(
+                        dim=dim,
+                        encoder_hidden_states_dim=768,
+                        num_heads=num_heads,
+                        qkv_bias=True,
+                        class_range=24,
+                        class_interval=4,
+                        attention_mode=attention_mode,
+                    )
+
+            # Attach to transformer
+            transformer.multitalk_audio_proj = audio_proj
+            transformer.multitalk_model_type = "infinitetalk"
+            log.info("Auto-initialized infinitetalk from merged model weights")
         transformer.eval()
 
         #ReCamMaster
@@ -1490,6 +1530,52 @@ class WanVideoModelLoader:
             else:
                 from .custom_linear import _replace_linear
                 transformer = _replace_linear(transformer, base_dtype, sd, scale_weights=scale_weights)
+
+
+        # PATCH: Re-attach multitalk module after linear replacement and re-load its weights
+        if sd is not None and any(k.startswith("multitalk_audio_proj.") for k in sd.keys()) and not hasattr(transformer, "multitalk_audio_proj"):
+            log.info("Re-attaching multitalk module after linear replacement")
+            from .multitalk.multitalk import AudioProjModel, SingleStreamMultiAttention
+            from .wanvideo.modules.model import WanLayerNorm
+
+            audio_proj = AudioProjModel(
+                seq_len=5,
+                seq_len_vf=8,
+                blocks=12,
+                channels=768,
+                intermediate_dim=512,
+                output_dim=768,
+                context_tokens=32,
+                norm_output_audio=True,
+            ).to(device=device, dtype=base_dtype)
+
+            # Initialize audio_cross_attn for each block if needed
+            if not hasattr(transformer.blocks[0], "audio_cross_attn"):
+                _num_heads = getattr(transformer, "num_heads", 40)
+                _dim = getattr(transformer, "dim", 5120)
+                for block in transformer.blocks:
+                    block.norm_x = WanLayerNorm(_dim, transformer.eps, elementwise_affine=True).to(device=device, dtype=base_dtype)
+                    block.audio_cross_attn = SingleStreamMultiAttention(
+                        dim=_dim,
+                        encoder_hidden_states_dim=768,
+                        num_heads=_num_heads,
+                        qkv_bias=True,
+                        class_range=24,
+                        class_interval=4,
+                        attention_mode=attention_mode,
+                    ).to(device=device, dtype=base_dtype)
+
+            transformer.multitalk_audio_proj = audio_proj
+            transformer.multitalk_model_type = "infinitetalk"
+
+            # Assign weights for multitalk module
+            try:
+                for name, value in sd.items():
+                    if name.startswith("multitalk_audio_proj."):
+                        set_module_tensor_to_device(transformer, name.replace("_orig_mod.", ""), device=transformer_load_device, dtype=base_dtype, value=value)
+                log.info("Loaded multitalk weights after re-attachment")
+            except Exception as e:
+                log.warn(f"Failed to load multitalk weights after re-attach: {e}")
                 transformer.patched_linear = True
 
         if "fast" in quantization or quantization == "fp4_scaled_fast":
